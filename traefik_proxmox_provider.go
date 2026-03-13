@@ -8,14 +8,28 @@ import (
 	"github.com/NX211/traefik-proxmox-provider/provider"
 )
 
-// Config the plugin configuration.
-type Config struct {
-	PollInterval   string `json:"pollInterval" yaml:"pollInterval" toml:"pollInterval"`
-	ApiEndpoint    string `json:"apiEndpoint" yaml:"apiEndpoint" toml:"apiEndpoint"`
-	ApiTokenId     string `json:"apiTokenId" yaml:"apiTokenId" toml:"apiTokenId"`
-	ApiToken       string `json:"apiToken" yaml:"apiToken" toml:"apiToken"`
-	ApiLogging     string `json:"apiLogging" yaml:"apiLogging" toml:"apiLogging"`
+// ClusterConfig represents a single Proxmox cluster/server configuration.
+// This allows configuring multiple independent Proxmox API endpoints from a single plugin instance.
+type ClusterConfig struct {
+	Name          string `json:"name" yaml:"name" toml:"name"`
+	ApiEndpoint   string `json:"apiEndpoint" yaml:"apiEndpoint" toml:"apiEndpoint"`
+	ApiTokenId    string `json:"apiTokenId" yaml:"apiTokenId" toml:"apiTokenId"`
+	ApiToken      string `json:"apiToken" yaml:"apiToken" toml:"apiToken"`
+	ApiLogging    string `json:"apiLogging" yaml:"apiLogging" toml:"apiLogging"`
 	ApiValidateSSL string `json:"apiValidateSSL" yaml:"apiValidateSSL" toml:"apiValidateSSL"`
+}
+
+// Config the plugin configuration.
+// Either the legacy single-cluster fields (ApiEndpoint/ApiTokenId/ApiToken/...) can be used,
+// or the multi-cluster `Clusters` list. If `Clusters` is empty, the legacy fields are used.
+type Config struct {
+	PollInterval   string          `json:"pollInterval" yaml:"pollInterval" toml:"pollInterval"`
+	ApiEndpoint    string          `json:"apiEndpoint" yaml:"apiEndpoint" toml:"apiEndpoint"`
+	ApiTokenId     string          `json:"apiTokenId" yaml:"apiTokenId" toml:"apiTokenId"`
+	ApiToken       string          `json:"apiToken" yaml:"apiToken" toml:"apiToken"`
+	ApiLogging     string          `json:"apiLogging" yaml:"apiLogging" toml:"apiLogging"`
+	ApiValidateSSL string          `json:"apiValidateSSL" yaml:"apiValidateSSL" toml:"apiValidateSSL"`
+	Clusters       []ClusterConfig `json:"clusters" yaml:"clusters" toml:"clusters"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -28,6 +42,7 @@ func CreateConfig() *Config {
 		ApiToken:       cfg.ApiToken,
 		ApiLogging:     cfg.ApiLogging,
 		ApiValidateSSL: cfg.ApiValidateSSL,
+		Clusters:       nil,
 	}
 }
 
@@ -45,6 +60,22 @@ func New(ctx context.Context, config *Config, name string) (*Provider, error) {
 		ApiToken:       config.ApiToken,
 		ApiLogging:     config.ApiLogging,
 		ApiValidateSSL: config.ApiValidateSSL,
+	}
+
+	// If multi-cluster configuration is provided, map it through to the provider.
+	if len(config.Clusters) > 0 {
+		providerConfig.Clusters = make([]provider.ClusterConfig, 0, len(config.Clusters))
+		for _, c := range config.Clusters {
+			pc := provider.ClusterConfig{
+				Name:           c.Name,
+				ApiEndpoint:    c.ApiEndpoint,
+				ApiTokenId:     c.ApiTokenId,
+				ApiToken:       c.ApiToken,
+				ApiLogging:     c.ApiLogging,
+				ApiValidateSSL: c.ApiValidateSSL,
+			}
+			providerConfig.Clusters = append(providerConfig.Clusters, pc)
+		}
 	}
 
 	innerProvider, err := provider.New(ctx, providerConfig, name)

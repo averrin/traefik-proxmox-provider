@@ -19,14 +19,27 @@ import (
 	"github.com/traefik/genconf/dynamic/types"
 )
 
-// Config the plugin configuration.
-type Config struct {
-	PollInterval   string `json:"pollInterval" yaml:"pollInterval" toml:"pollInterval"`
+// ClusterConfig represents the configuration for a single Proxmox cluster/server.
+type ClusterConfig struct {
+	Name           string `json:"name" yaml:"name" toml:"name"`
 	ApiEndpoint    string `json:"apiEndpoint" yaml:"apiEndpoint" toml:"apiEndpoint"`
 	ApiTokenId     string `json:"apiTokenId" yaml:"apiTokenId" toml:"apiTokenId"`
 	ApiToken       string `json:"apiToken" yaml:"apiToken" toml:"apiToken"`
 	ApiLogging     string `json:"apiLogging" yaml:"apiLogging" toml:"apiLogging"`
 	ApiValidateSSL string `json:"apiValidateSSL" yaml:"apiValidateSSL" toml:"apiValidateSSL"`
+}
+
+// Config the plugin configuration.
+// Either the legacy single-cluster fields (ApiEndpoint/ApiTokenId/ApiToken/...) can be used,
+// or the multi-cluster `Clusters` list. If `Clusters` is empty, the legacy fields are used.
+type Config struct {
+	PollInterval   string          `json:"pollInterval" yaml:"pollInterval" toml:"pollInterval"`
+	ApiEndpoint    string          `json:"apiEndpoint" yaml:"apiEndpoint" toml:"apiEndpoint"`
+	ApiTokenId     string          `json:"apiTokenId" yaml:"apiTokenId" toml:"apiTokenId"`
+	ApiToken       string          `json:"apiToken" yaml:"apiToken" toml:"apiToken"`
+	ApiLogging     string          `json:"apiLogging" yaml:"apiLogging" toml:"apiLogging"`
+	ApiValidateSSL string          `json:"apiValidateSSL" yaml:"apiValidateSSL" toml:"apiValidateSSL"`
+	Clusters       []ClusterConfig `json:"clusters" yaml:"clusters" toml:"clusters"`
 }
 
 // CreateConfig creates the default plugin configuration.
@@ -35,6 +48,7 @@ func CreateConfig() *Config {
 		PollInterval:   "30s", // Default to 30 seconds for polling
 		ApiValidateSSL: "true",
 		ApiLogging:     "info",
+		Clusters:       nil,
 	}
 }
 
@@ -42,8 +56,13 @@ func CreateConfig() *Config {
 type Provider struct {
 	name         string
 	pollInterval time.Duration
-	client       *internal.ProxmoxClient
+	clients      []clusterClient
 	cancel       func()
+}
+
+type clusterClient struct {
+	name   string
+	client *internal.ProxmoxClient
 }
 
 // New creates a new Provider plugin.
@@ -62,26 +81,75 @@ func New(ctx context.Context, config *Config, name string) (*Provider, error) {
 		return nil, fmt.Errorf("poll interval must be at least 5 seconds, got %v", pi)
 	}
 
-	pc, err := newParserConfig(
-		config.ApiEndpoint,
-		config.ApiTokenId,
-		config.ApiToken,
-		config.ApiLogging,
-		config.ApiValidateSSL == "true",
-	)
-	if err != nil {
-		return nil, fmt.Errorf("invalid parser config: %w", err)
-	}
-	client := newClient(pc)
+	var clients []clusterClient
 
-	if err := logVersion(client, ctx); err != nil {
-		return nil, fmt.Errorf("failed to get Proxmox version: %w", err)
+	// Legacy single-cluster configuration if no clusters are defined.
+	if len(config.Clusters) == 0 {
+		pc, err := newParserConfig(
+			config.ApiEndpoint,
+			config.ApiTokenId,
+			config.ApiToken,
+			config.ApiLogging,
+			config.ApiValidateSSL == "true",
+		)
+		if err != nil {
+			return nil, fmt.Errorf("invalid parser config: %w", err)
+		}
+		client := newClient(pc)
+
+		if err := logVersion(client, ctx, config.ApiEndpoint); err != nil {
+			return nil, fmt.Errorf("failed to get Proxmox version: %w", err)
+		}
+
+		clients = append(clients, clusterClient{
+			name:   config.ApiEndpoint,
+			client: client,
+		})
+	} else {
+		for _, cc := range config.Clusters {
+			// Fall back to top-level logging/SSL if not provided per-cluster.
+			logLevel := cc.ApiLogging
+			if logLevel == "" {
+				logLevel = config.ApiLogging
+			}
+			validateSSL := cc.ApiValidateSSL
+			if validateSSL == "" {
+				validateSSL = config.ApiValidateSSL
+			}
+
+			pc, err := newParserConfig(
+				cc.ApiEndpoint,
+				cc.ApiTokenId,
+				cc.ApiToken,
+				logLevel,
+				validateSSL == "true",
+			)
+			if err != nil {
+				return nil, fmt.Errorf("invalid parser config for cluster %q: %w", cc.Name, err)
+			}
+
+			client := newClient(pc)
+
+			clusterName := cc.Name
+			if clusterName == "" {
+				clusterName = cc.ApiEndpoint
+			}
+
+			if err := logVersion(client, ctx, clusterName); err != nil {
+				return nil, fmt.Errorf("failed to get Proxmox version for cluster %q: %w", clusterName, err)
+			}
+
+			clients = append(clients, clusterClient{
+				name:   clusterName,
+				client: client,
+			})
+		}
 	}
 
 	return &Provider{
 		name:         name,
 		pollInterval: pi,
-		client:       client,
+		clients:      clients,
 	}, nil
 }
 
@@ -130,12 +198,34 @@ func (p *Provider) loadConfiguration(ctx context.Context, cfgChan chan<- json.Ma
 }
 
 func (p *Provider) updateConfiguration(ctx context.Context, cfgChan chan<- json.Marshaler) error {
-	servicesMap, err := getServiceMap(p.client, ctx)
-	if err != nil {
-		return fmt.Errorf("error getting service map: %w", err)
+	combinedServices := make(map[string][]internal.Service)
+	var lastErr error
+	hadSuccess := false
+
+	for _, c := range p.clients {
+		servicesMap, err := getServiceMap(c.client, ctx)
+		if err != nil {
+			lastErr = err
+			log.Printf("Error getting service map for cluster %s: %v", c.name, err)
+			continue
+		}
+
+		hadSuccess = true
+		for nodeName, services := range servicesMap {
+			combinedServices[nodeName] = append(combinedServices[nodeName], services...)
+		}
 	}
 
-	configuration := generateConfiguration(servicesMap)
+	if !hadSuccess && lastErr != nil {
+		return fmt.Errorf("error getting service map from all clusters: %w", lastErr)
+	}
+
+	if !hadSuccess {
+		// No clusters configured; should not normally happen due to validation.
+		return nil
+	}
+
+	configuration := generateConfiguration(combinedServices)
 	cfgChan <- &dynamic.JSONPayload{Configuration: configuration}
 	return nil
 }
@@ -174,12 +264,16 @@ func newClient(pc ParserConfig) *internal.ProxmoxClient {
 	return internal.NewProxmoxClient(pc.ApiEndpoint, pc.TokenId, pc.Token, pc.ValidateSSL, pc.LogLevel)
 }
 
-func logVersion(client *internal.ProxmoxClient, ctx context.Context) error {
+func logVersion(client *internal.ProxmoxClient, ctx context.Context, clusterName string) error {
 	version, err := client.GetVersion(ctx)
 	if err != nil {
 		return err
 	}
-	log.Printf("Connected to Proxmox VE version %s", version.Release)
+	if clusterName != "" {
+		log.Printf("Connected to Proxmox VE cluster %s, version %s", clusterName, version.Release)
+	} else {
+		log.Printf("Connected to Proxmox VE version %s", version.Release)
+	}
 	return nil
 }
 
@@ -689,10 +783,17 @@ func validateConfig(config *Config) error {
 		return errors.New("configuration cannot be nil")
 	}
 
+	// If clusters are defined, we are in multi-cluster mode and don't require
+	// the legacy top-level API endpoint/token fields here.
+	if len(config.Clusters) > 0 {
+		return nil
+	}
+
 	if config.PollInterval == "" {
 		return errors.New("poll interval must be set")
 	}
 
+	// Legacy single-cluster mode.
 	if config.ApiEndpoint == "" {
 		return errors.New("API endpoint must be set")
 	}

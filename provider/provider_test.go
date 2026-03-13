@@ -148,6 +148,68 @@ func TestProviderValidateConfig(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "Valid multi-cluster config",
+			config: &Config{
+				PollInterval: "5s",
+				Clusters: []ClusterConfig{
+					{
+						ApiEndpoint:    "https://proxmox-a.example.com",
+						ApiTokenId:     "test@pam!a",
+						ApiToken:       "test-token-a",
+						ApiValidateSSL: "true",
+						ApiLogging:     "info",
+					},
+					{
+						ApiEndpoint:    "https://proxmox-b.example.com",
+						ApiTokenId:     "test@pam!b",
+						ApiToken:       "test-token-b",
+						ApiValidateSSL: "true",
+						ApiLogging:     "debug",
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "Multi-cluster missing endpoint",
+			config: &Config{
+				PollInterval: "5s",
+				Clusters: []ClusterConfig{
+					{
+						ApiTokenId: "test@pam!a",
+						ApiToken:   "test-token-a",
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "Multi-cluster missing token ID",
+			config: &Config{
+				PollInterval: "5s",
+				Clusters: []ClusterConfig{
+					{
+						ApiEndpoint: "https://proxmox-a.example.com",
+						ApiToken:    "test-token-a",
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "Multi-cluster missing token",
+			config: &Config{
+				PollInterval: "5s",
+				Clusters: []ClusterConfig{
+					{
+						ApiEndpoint: "https://proxmox-a.example.com",
+						ApiTokenId:  "test@pam!a",
+					},
+				},
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tt := range tests {
